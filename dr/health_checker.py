@@ -30,12 +30,57 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
     """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if response.status_code == 200:
+            return True, "ready"
+        reasons = body.get("reasons") if isinstance(body, dict) else None
+        return False, ";".join(str(x) for x in reasons) if reasons else f"http_{response.status_code}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
     """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    if interval <= 0 or timeout <= 0 or threshold <= 0 or duration < 0:
+        raise ValueError("interval, timeout, threshold must be positive and duration non-negative")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # A checker starts from the operational assumption that a region is healthy.
+    # This avoids emitting a synthetic initial HEALTHY event; logs should contain
+    # meaningful transitions such as the thresholded UNHEALTHY alarm.
+    states = {region: "HEALTHY" for region in URL}
+    fails = {region: 0 for region in URL}
+    deadline = time.monotonic() + duration
+    with out.open("a", encoding="utf-8") as log:
+        while time.monotonic() <= deadline:
+            for region in URL:
+                ready, reason = probe(region, timeout)
+                if ready:
+                    fails[region] = 0
+                    new_state = "HEALTHY"
+                else:
+                    fails[region] += 1
+                    new_state = "UNHEALTHY" if fails[region] >= threshold else states[region]
+                if new_state is not None and new_state != states[region]:
+                    record = {
+                        "ts": time.time(),
+                        "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                        "event": "state_change", "region": region,
+                        "from": states[region], "to": new_state,
+                        "reason": reason, "consecutive_fails": fails[region],
+                        "interval_s": interval, "threshold": threshold,
+                    }
+                    log.write(json.dumps(record) + "\n")
+                    log.flush()
+                    print("HEALTH", json.dumps(record))
+                    states[region] = new_state
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(interval, remaining))
 
 
 if __name__ == "__main__":
